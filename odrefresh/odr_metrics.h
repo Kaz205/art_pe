@@ -55,8 +55,7 @@ class OdrMetrics final {
     kNoSpace = 2,
     kIoError = 3,
     kDex2OatError = 4,
-    // Value 5 was kTimeLimitExceeded, but has been removed in favour of
-    // reporting the exit code for Dex2Oat (set to ExecResult::kTimedOut)
+    kTimeLimitExceeded = 5,
     kStagingFailed = 6,
     kInstallFailed = 7,
   };
