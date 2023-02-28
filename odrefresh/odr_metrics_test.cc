@@ -15,23 +15,20 @@
  */
 
 #include "odr_metrics.h"
+#include "base/casts.h"
+#include "odr_metrics_record.h"
 
 #include <unistd.h>
 
-#include <chrono>
 #include <fstream>
 #include <memory>
 #include <string>
-#include <thread>
 
-#include "base/casts.h"
+#include "android-base/result-gmock.h"
 #include "base/common_art_test.h"
-#include "odr_metrics_record.h"
 
 namespace art {
 namespace odrefresh {
-
-using std::chrono_literals::operator""ms;  // NOLINT
 
 class OdrMetricsTest : public CommonArtTest {
  public:
@@ -53,6 +50,14 @@ class OdrMetricsTest : public CommonArtTest {
     return OS::FileExists(path);
   }
 
+  bool RemoveMetricsFile() const {
+    const char* path = metrics_file_path_.c_str();
+    if (OS::FileExists(path)) {
+      return unlink(path) == 0;
+    }
+    return true;
+  }
+
   const std::string GetCacheDirectory() const { return cache_directory_; }
   const std::string GetMetricsFilePath() const { return metrics_file_path_; }
 
@@ -62,29 +67,79 @@ class OdrMetricsTest : public CommonArtTest {
   std::string cache_directory_;
 };
 
-TEST_F(OdrMetricsTest, MetricsFileIsNotCreatedIfNotEnabled) {
+TEST_F(OdrMetricsTest, ToRecordFailsIfNotTriggered) {
+  {
+    OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
+    OdrMetricsRecord record {};
+    EXPECT_FALSE(metrics.ToRecord(&record));
+  }
+
+  {
+    OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
+    metrics.SetArtApexVersion(99);
+    metrics.SetStage(OdrMetrics::Stage::kCheck);
+    metrics.SetStatus(OdrMetrics::Status::kNoSpace);
+    OdrMetricsRecord record {};
+    EXPECT_FALSE(metrics.ToRecord(&record));
+  }
+}
+
+TEST_F(OdrMetricsTest, ToRecordSucceedsIfTriggered) {
+  OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
+  metrics.SetArtApexVersion(99);
+  metrics.SetTrigger(OdrMetrics::Trigger::kApexVersionMismatch);
+  metrics.SetStage(OdrMetrics::Stage::kCheck);
+  metrics.SetStatus(OdrMetrics::Status::kNoSpace);
+
+  OdrMetricsRecord record{};
+  EXPECT_TRUE(metrics.ToRecord(&record));
+
+  EXPECT_EQ(99, record.art_apex_version);
+  EXPECT_EQ(OdrMetrics::Trigger::kApexVersionMismatch,
+            enum_cast<OdrMetrics::Trigger>(record.trigger));
+  EXPECT_EQ(OdrMetrics::Stage::kCheck, enum_cast<OdrMetrics::Stage>(record.stage_reached));
+  EXPECT_EQ(OdrMetrics::Status::kNoSpace, enum_cast<OdrMetrics::Status>(record.status));
+}
+
+TEST_F(OdrMetricsTest, MetricsFileIsNotCreatedIfNotTriggered) {
+  EXPECT_TRUE(RemoveMetricsFile());
+
   // Metrics file is (potentially) written in OdrMetrics destructor.
   {
     OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
     metrics.SetArtApexVersion(99);
-    metrics.SetTrigger(OdrMetrics::Trigger::kApexVersionMismatch);
     metrics.SetStage(OdrMetrics::Stage::kCheck);
     metrics.SetStatus(OdrMetrics::Status::kNoSpace);
   }
   EXPECT_FALSE(MetricsFileExists());
 }
 
-TEST_F(OdrMetricsTest, MetricsFileIsCreatedIfEnabled) {
+TEST_F(OdrMetricsTest, NoMetricsFileIsCreatedIfTriggered) {
+  EXPECT_TRUE(RemoveMetricsFile());
+
   // Metrics file is (potentially) written in OdrMetrics destructor.
   {
     OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
-    metrics.SetEnabled(true);
     metrics.SetArtApexVersion(101);
     metrics.SetTrigger(OdrMetrics::Trigger::kDexFilesChanged);
     metrics.SetStage(OdrMetrics::Stage::kCheck);
     metrics.SetStatus(OdrMetrics::Status::kNoSpace);
   }
   EXPECT_TRUE(MetricsFileExists());
+}
+
+TEST_F(OdrMetricsTest, StageDoesNotAdvancedAfterFailure) {
+  OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
+  metrics.SetArtApexVersion(1999);
+  metrics.SetTrigger(OdrMetrics::Trigger::kMissingArtifacts);
+  metrics.SetStage(OdrMetrics::Stage::kCheck);
+  metrics.SetStatus(OdrMetrics::Status::kNoSpace);
+  metrics.SetStage(OdrMetrics::Stage::kComplete);
+
+  OdrMetricsRecord record{};
+  EXPECT_TRUE(metrics.ToRecord(&record));
+
+  EXPECT_EQ(OdrMetrics::Stage::kCheck, enum_cast<OdrMetrics::Stage>(record.stage_reached));
 }
 
 TEST_F(OdrMetricsTest, TimeValuesAreRecorded) {
@@ -95,54 +150,68 @@ TEST_F(OdrMetricsTest, TimeValuesAreRecorded) {
   metrics.SetStatus(OdrMetrics::Status::kOK);
 
   // Primary boot classpath compilation time.
+  OdrMetricsRecord record{};
   {
     metrics.SetStage(OdrMetrics::Stage::kPrimaryBootClasspath);
     ScopedOdrCompilationTimer timer(metrics);
-    std::this_thread::sleep_for(100ms);
+    sleep(2u);
   }
-  OdrMetricsRecord record = metrics.ToRecord();
-  EXPECT_EQ(enum_cast<OdrMetrics::Stage>(record.stage_reached),
-            OdrMetrics::Stage::kPrimaryBootClasspath);
-  EXPECT_GT(record.primary_bcp_compilation_millis, 0);
-  EXPECT_LT(record.primary_bcp_compilation_millis, 300);
-  EXPECT_EQ(record.secondary_bcp_compilation_millis, 0);
-  EXPECT_EQ(record.system_server_compilation_millis, 0);
+  EXPECT_TRUE(metrics.ToRecord(&record));
+  EXPECT_EQ(OdrMetrics::Stage::kPrimaryBootClasspath,
+            enum_cast<OdrMetrics::Stage>(record.stage_reached));
+  EXPECT_NE(0, record.primary_bcp_compilation_millis);
+  EXPECT_GT(10'000, record.primary_bcp_compilation_millis);
+  EXPECT_EQ(0, record.secondary_bcp_compilation_millis);
+  EXPECT_EQ(0, record.system_server_compilation_millis);
 
   // Secondary boot classpath compilation time.
   {
     metrics.SetStage(OdrMetrics::Stage::kSecondaryBootClasspath);
     ScopedOdrCompilationTimer timer(metrics);
-    std::this_thread::sleep_for(100ms);
+    sleep(2u);
   }
-  record = metrics.ToRecord();
+  EXPECT_TRUE(metrics.ToRecord(&record));
   EXPECT_EQ(OdrMetrics::Stage::kSecondaryBootClasspath,
             enum_cast<OdrMetrics::Stage>(record.stage_reached));
-  EXPECT_GT(record.primary_bcp_compilation_millis, 0);
-  EXPECT_GT(record.secondary_bcp_compilation_millis, 0);
-  EXPECT_LT(record.secondary_bcp_compilation_millis, 300);
-  EXPECT_EQ(record.system_server_compilation_millis, 0);
+  EXPECT_NE(0, record.primary_bcp_compilation_millis);
+  EXPECT_NE(0, record.secondary_bcp_compilation_millis);
+  EXPECT_GT(10'000, record.secondary_bcp_compilation_millis);
+  EXPECT_EQ(0, record.system_server_compilation_millis);
 
   // system_server classpath compilation time.
   {
     metrics.SetStage(OdrMetrics::Stage::kSystemServerClasspath);
     ScopedOdrCompilationTimer timer(metrics);
-    std::this_thread::sleep_for(100ms);
+    sleep(2u);
   }
-  record = metrics.ToRecord();
+  EXPECT_TRUE(metrics.ToRecord(&record));
   EXPECT_EQ(OdrMetrics::Stage::kSystemServerClasspath,
             enum_cast<OdrMetrics::Stage>(record.stage_reached));
-  EXPECT_GT(record.primary_bcp_compilation_millis, 0);
-  EXPECT_GT(record.secondary_bcp_compilation_millis, 0);
-  EXPECT_GT(record.system_server_compilation_millis, 0);
-  EXPECT_LT(record.system_server_compilation_millis, 300);
+  EXPECT_NE(0, record.primary_bcp_compilation_millis);
+  EXPECT_NE(0, record.secondary_bcp_compilation_millis);
+  EXPECT_NE(0, record.system_server_compilation_millis);
+  EXPECT_GT(10'000, record.system_server_compilation_millis);
 }
 
 TEST_F(OdrMetricsTest, CacheSpaceValuesAreUpdated) {
-  OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
-  metrics.CaptureSpaceFreeEnd();
-  OdrMetricsRecord record = metrics.ToRecord();
-  EXPECT_GT(record.cache_space_free_start_mib, 0);
-  EXPECT_GT(record.cache_space_free_end_mib, 0);
+  OdrMetricsRecord snap {};
+  snap.cache_space_free_start_mib = -1;
+  snap.cache_space_free_end_mib = -1;
+  {
+    OdrMetrics metrics(GetCacheDirectory(), GetMetricsFilePath());
+    metrics.SetArtApexVersion(1999);
+    metrics.SetTrigger(OdrMetrics::Trigger::kMissingArtifacts);
+    metrics.SetStage(OdrMetrics::Stage::kCheck);
+    metrics.SetStatus(OdrMetrics::Status::kOK);
+    EXPECT_TRUE(metrics.ToRecord(&snap));
+    EXPECT_NE(0, snap.cache_space_free_start_mib);
+    EXPECT_EQ(0, snap.cache_space_free_end_mib);
+  }
+
+  OdrMetricsRecord on_disk{};
+  EXPECT_THAT(on_disk.ReadFromFile(GetMetricsFilePath()), android::base::testing::Ok());
+  EXPECT_EQ(snap.cache_space_free_start_mib, on_disk.cache_space_free_start_mib);
+  EXPECT_NE(0, on_disk.cache_space_free_end_mib);
 }
 
 }  // namespace odrefresh
