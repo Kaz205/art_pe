@@ -110,10 +110,10 @@ pid_t ExecWithoutWait(const std::vector<std::string>& arg_vector, std::string* e
   }
 }
 
-ExecResult WaitChild(pid_t pid,
-                     const std::vector<std::string>& arg_vector,
-                     bool no_wait,
-                     std::string* error_msg) {
+int WaitChild(pid_t pid,
+              const std::vector<std::string>& arg_vector,
+              bool no_wait,
+              std::string* error_msg) {
   siginfo_t info;
   // WNOWAIT leaves the child in a waitable state. The call is still blocking.
   int options = WEXITED | (no_wait ? WNOWAIT : 0);
@@ -122,7 +122,7 @@ ExecResult WaitChild(pid_t pid,
                               ToCommandLine(arg_vector).c_str(),
                               pid,
                               strerror(errno));
-    return {.status = ExecResult::kUnknown};
+    return -1;
   }
   if (info.si_pid != pid) {
     *error_msg = StringPrintf("waitid failed for (%s): wanted pid %d, got %d: %s",
@@ -130,38 +130,38 @@ ExecResult WaitChild(pid_t pid,
                               pid,
                               info.si_pid,
                               strerror(errno));
-    return {.status = ExecResult::kUnknown};
+    return -1;
   }
   if (info.si_code != CLD_EXITED) {
     *error_msg =
         StringPrintf("Failed to execute (%s) because the child process is terminated by signal %d",
                      ToCommandLine(arg_vector).c_str(),
                      info.si_status);
-    return {.status = ExecResult::kSignaled, .signal = info.si_status};
+    return -1;
   }
-  return {.status = ExecResult::kExited, .exit_code = info.si_status};
+  return info.si_status;
 }
 
 // A fallback implementation of `WaitChildWithTimeout` that creates a thread to wait instead of
 // relying on `pidfd_open`.
-ExecResult WaitChildWithTimeoutFallback(pid_t pid,
-                                        const std::vector<std::string>& arg_vector,
-                                        int timeout_ms,
-                                        std::string* error_msg) {
+int WaitChildWithTimeoutFallback(pid_t pid,
+                                 const std::vector<std::string>& arg_vector,
+                                 int timeout_ms,
+                                 bool* timed_out,
+                                 std::string* error_msg) {
   bool child_exited = false;
-  bool timed_out = false;
   std::condition_variable cv;
   std::mutex m;
 
   std::thread wait_thread([&]() {
     std::unique_lock<std::mutex> lock(m);
     if (!cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return child_exited; })) {
-      timed_out = true;
+      *timed_out = true;
       kill(pid, SIGKILL);
     }
   });
 
-  ExecResult result = WaitChild(pid, arg_vector, /*no_wait=*/true, error_msg);
+  int status = WaitChild(pid, arg_vector, /*no_wait=*/true, error_msg);
 
   {
     std::unique_lock<std::mutex> lock(m);
@@ -171,23 +171,24 @@ ExecResult WaitChildWithTimeoutFallback(pid_t pid,
   wait_thread.join();
 
   // The timeout error should have a higher priority than any other error.
-  if (timed_out) {
+  if (*timed_out) {
     *error_msg =
         StringPrintf("Failed to execute (%s) because the child process timed out after %dms",
                      ToCommandLine(arg_vector).c_str(),
                      timeout_ms);
-    return ExecResult{.status = ExecResult::kTimedOut};
+    return -1;
   }
 
-  return result;
+  return status;
 }
 
 // Waits for the child process to finish and leaves the child in a waitable state.
-ExecResult WaitChildWithTimeout(pid_t pid,
-                                unique_fd pidfd,
-                                const std::vector<std::string>& arg_vector,
-                                int timeout_ms,
-                                std::string* error_msg) {
+int WaitChildWithTimeout(pid_t pid,
+                         unique_fd pidfd,
+                         const std::vector<std::string>& arg_vector,
+                         int timeout_ms,
+                         bool* timed_out,
+                         std::string* error_msg) {
   auto cleanup = android::base::make_scope_guard([&]() {
     kill(pid, SIGKILL);
     std::string ignored_error_msg;
@@ -203,14 +204,15 @@ ExecResult WaitChildWithTimeout(pid_t pid,
 
   if (poll_ret < 0) {
     *error_msg = StringPrintf("poll failed for pid %d: %s", pid, strerror(errno));
-    return {.status = ExecResult::kUnknown};
+    return -1;
   }
   if (poll_ret == 0) {
+    *timed_out = true;
     *error_msg =
         StringPrintf("Failed to execute (%s) because the child process timed out after %dms",
                      ToCommandLine(arg_vector).c_str(),
                      timeout_ms);
-    return {.status = ExecResult::kTimedOut};
+    return -1;
   }
 
   cleanup.Disable();
@@ -248,47 +250,54 @@ bool ParseProcStat(const std::string& stat_content,
 
 int ExecUtils::ExecAndReturnCode(const std::vector<std::string>& arg_vector,
                                  std::string* error_msg) const {
-  return ExecAndReturnResult(arg_vector, /*timeout_sec=*/-1, error_msg).exit_code;
+  bool ignored_timed_out;
+  return ExecAndReturnCode(arg_vector, /*timeout_sec=*/-1, &ignored_timed_out, error_msg);
 }
 
-ExecResult ExecUtils::ExecAndReturnResult(const std::vector<std::string>& arg_vector,
-                                          int timeout_sec,
-                                          std::string* error_msg) const {
-  return ExecAndReturnResult(arg_vector, timeout_sec, ExecCallbacks(), /*stat=*/nullptr, error_msg);
+int ExecUtils::ExecAndReturnCode(const std::vector<std::string>& arg_vector,
+                                 int timeout_sec,
+                                 bool* timed_out,
+                                 std::string* error_msg) const {
+  return ExecAndReturnCode(
+      arg_vector, timeout_sec, ExecCallbacks(), timed_out, /*stat=*/nullptr, error_msg);
 }
 
-ExecResult ExecUtils::ExecAndReturnResult(const std::vector<std::string>& arg_vector,
-                                          int timeout_sec,
-                                          const ExecCallbacks& callbacks,
-                                          /*out*/ ProcessStat* stat,
-                                          /*out*/ std::string* error_msg) const {
+int ExecUtils::ExecAndReturnCode(const std::vector<std::string>& arg_vector,
+                                 int timeout_sec,
+                                 const ExecCallbacks& callbacks,
+                                 /*out*/ bool* timed_out,
+                                 /*out*/ ProcessStat* stat,
+                                 /*out*/ std::string* error_msg) const {
+  *timed_out = false;
+
   if (timeout_sec > INT_MAX / 1000) {
     *error_msg = "Timeout too large";
-    return {.status = ExecResult::kStartFailed};
+    return -1;
   }
 
   // Start subprocess.
   pid_t pid = ExecWithoutWait(arg_vector, error_msg);
   if (pid == -1) {
-    return {.status = ExecResult::kStartFailed};
+    return -1;
   }
 
   callbacks.on_start(pid);
 
   // Wait for subprocess to finish.
-  ExecResult result;
+  int status;
   if (timeout_sec >= 0) {
     unique_fd pidfd = PidfdOpen(pid);
     if (pidfd.get() >= 0) {
-      result =
-          WaitChildWithTimeout(pid, std::move(pidfd), arg_vector, timeout_sec * 1000, error_msg);
+      status = WaitChildWithTimeout(
+          pid, std::move(pidfd), arg_vector, timeout_sec * 1000, timed_out, error_msg);
     } else {
       LOG(DEBUG) << StringPrintf(
           "pidfd_open failed for pid %d: %s, falling back", pid, strerror(errno));
-      result = WaitChildWithTimeoutFallback(pid, arg_vector, timeout_sec * 1000, error_msg);
+      status =
+          WaitChildWithTimeoutFallback(pid, arg_vector, timeout_sec * 1000, timed_out, error_msg);
     }
   } else {
-    result = WaitChild(pid, arg_vector, /*no_wait=*/true, error_msg);
+    status = WaitChild(pid, arg_vector, /*no_wait=*/true, error_msg);
   }
 
   if (stat != nullptr) {
@@ -302,12 +311,12 @@ ExecResult ExecUtils::ExecAndReturnResult(const std::vector<std::string>& arg_ve
 
   std::string local_error_msg;
   // TODO(jiakaiz): Use better logic to detect waitid failure.
-  if (WaitChild(pid, arg_vector, /*no_wait=*/false, &local_error_msg).status ==
-      ExecResult::kUnknown) {
+  if (WaitChild(pid, arg_vector, /*no_wait=*/false, &local_error_msg) < 0 &&
+      local_error_msg.find("waitid failed") == 0) {
     LOG(ERROR) << "Failed to clean up child process '" << arg_vector[0] << "': " << local_error_msg;
   }
 
-  return result;
+  return status;
 }
 
 bool ExecUtils::Exec(const std::vector<std::string>& arg_vector, std::string* error_msg) const {
