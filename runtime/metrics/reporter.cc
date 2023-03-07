@@ -196,10 +196,12 @@ void MetricsReporter::MaybeResetTimeout() {
   }
 }
 
-ArtMetrics* MetricsReporter::GetMetrics() { return runtime_->GetMetrics(); }
+const ArtMetrics* MetricsReporter::GetMetrics() {
+  return runtime_->GetMetrics();
+}
 
 void MetricsReporter::ReportMetrics() {
-  ArtMetrics* metrics = GetMetrics();
+  const ArtMetrics* metrics = GetMetrics();
 
   if (!session_started_) {
     for (auto& backend : backends_) {
@@ -208,7 +210,9 @@ void MetricsReporter::ReportMetrics() {
     session_started_ = true;
   }
 
-  metrics->ReportAllMetricsAndResetValueMetrics(ToRawPointers(backends_));
+  for (auto& backend : backends_) {
+    metrics->ReportAllMetrics(backend.get());
+  }
 }
 
 void MetricsReporter::UpdateSessionInBackends() {

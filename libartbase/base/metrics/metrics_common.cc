@@ -65,40 +65,32 @@ ART_METRICS(ART_METRIC)
 {
 }
 
-void ArtMetrics::ReportAllMetricsAndResetValueMetrics(
-    const std::vector<MetricsBackend*>& backends) {
-  for (auto& backend : backends) {
-    backend->BeginReport(MilliTime() - beginning_timestamp_);
-  }
+void ArtMetrics::ReportAllMetrics(MetricsBackend* backend) const {
+  backend->BeginReport(MilliTime() - beginning_timestamp_);
 
-#define REPORT_METRIC(name, Kind, ...) name()->Report(backends);
-  ART_EVENT_METRICS(REPORT_METRIC)
-#undef REPORT_METRIC
+#define ART_METRIC(name, Kind, ...) name()->Report(backend);
+  ART_METRICS(ART_METRIC)
+#undef ART_METRIC
 
-#define REPORT_METRIC(name, Kind, ...) name()->ReportAndReset(backends);
-  ART_VALUE_METRICS(REPORT_METRIC)
-#undef REPORT_METRIC
-
-  for (auto& backend : backends) {
-    backend->EndReport();
-  }
+  backend->EndReport();
 }
 
-void ArtMetrics::DumpForSigQuit(std::ostream& os) {
+void ArtMetrics::DumpForSigQuit(std::ostream& os) const {
   StringBackend backend(std::make_unique<TextFormatter>());
-  ReportAllMetricsAndResetValueMetrics({&backend});
+  ReportAllMetrics(&backend);
   os << backend.GetAndResetBuffer();
 }
 
 void ArtMetrics::Reset() {
   beginning_timestamp_ = MilliTime();
-#define RESET_METRIC(name, ...) name##_.Reset();
-  ART_METRICS(RESET_METRIC)
-#undef RESET_METRIC
+#define ART_METRIC(name, kind, ...) name##_.Reset();
+  ART_METRICS(ART_METRIC);
+#undef ART_METRIC
 }
 
 StringBackend::StringBackend(std::unique_ptr<MetricsFormatter> formatter)
-    : formatter_(std::move(formatter)) {}
+  : formatter_(std::move(formatter))
+{}
 
 std::string StringBackend::GetAndResetBuffer() {
   return formatter_->GetAndResetBuffer();
