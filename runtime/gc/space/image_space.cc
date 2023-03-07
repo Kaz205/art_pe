@@ -49,6 +49,7 @@
 #include "dex/art_dex_file_loader.h"
 #include "dex/dex_file_loader.h"
 #include "exec_utils.h"
+#include "fmt/format.h"
 #include "gc/accounting/space_bitmap-inl.h"
 #include "gc/task_processor.h"
 #include "image-inl.h"
@@ -69,13 +70,19 @@ namespace art {
 namespace gc {
 namespace space {
 
-using android::base::Join;
-using android::base::StringAppendF;
-using android::base::StringPrintf;
+namespace {
+
+using ::android::base::Join;
+using ::android::base::StringAppendF;
+using ::android::base::StringPrintf;
+
+using ::fmt::literals::operator""_format;  // NOLINT
 
 // We do not allow the boot image and extensions to take more than 1GiB. They are
 // supposed to be much smaller and allocating more that this would likely fail anyway.
 static constexpr size_t kMaxTotalImageReservationSize = 1 * GB;
+
+}  // namespace
 
 Atomic<uint32_t> ImageSpace::bitmap_index_(0);
 
@@ -1922,12 +1929,29 @@ bool ImageSpace::BootImageLayout::ReadHeader(const std::string& base_location,
     return false;
   }
 
-  // Validate oat files. We do it here so that the boot image will be re-compiled in memory if it's
-  // outdated.
-  size_t component_count = (header.GetImageSpaceCount() == 1u) ? header.GetComponentCount() : 1u;
-  for (size_t i = 0; i < header.GetImageSpaceCount(); i++) {
-    if (!ValidateOatFile(base_location, base_filename, bcp_index + i, component_count, error_msg)) {
-      return false;
+  bool validate_oat_files = true;
+  Runtime* runtime = Runtime::Current();
+  if (runtime != nullptr && runtime->GetHeap() != nullptr) {
+    for (const ImageSpace* image_space : runtime->GetHeap()->GetBootImageSpaces()) {
+      if (image_space->GetComponentCount() == header.GetImageSpaceCount() &&
+          image_space->GetImageHeader().GetImageChecksum() == header.GetImageChecksum()) {
+        // This image has been loaded by the runtime, meaning that the oat files were validated when
+        // the runtime loaded them, so we don't have to validate them again.
+        validate_oat_files = false;
+        break;
+      }
+    }
+  }
+
+  if (validate_oat_files) {
+    // Validate oat files. We do it here so that the boot image will be re-compiled in memory if
+    // it's outdated.
+    size_t component_count = (header.GetImageSpaceCount() == 1u) ? header.GetComponentCount() : 1u;
+    for (size_t i = 0; i < header.GetImageSpaceCount(); i++) {
+      if (!ValidateOatFile(
+              base_location, base_filename, bcp_index + i, component_count, error_msg)) {
+        return false;
+      }
     }
   }
 
@@ -3579,6 +3603,15 @@ bool ImageSpace::ValidateOatFile(const OatFile& oat_file,
                                  ArrayRef<const std::string> dex_filenames,
                                  ArrayRef<const int> dex_fds) {
   if (!ValidateApexVersions(oat_file, error_msg)) {
+    return false;
+  }
+
+  // For a boot image, the key value store only exists in the first OAT file. Skip other OAT files.
+  if (oat_file.GetOatHeader().GetKeyValueStoreSize() != 0 &&
+      oat_file.GetOatHeader().IsConcurrentCopying() != gUseReadBarrier) {
+    *error_msg =
+        "ValidateOatFile found read barrier state mismatch (oat file: {}, runtime: {})"_format(
+            oat_file.GetOatHeader().IsConcurrentCopying(), gUseReadBarrier);
     return false;
   }
 

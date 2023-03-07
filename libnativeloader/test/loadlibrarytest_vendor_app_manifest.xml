@@ -16,16 +16,17 @@
  -->
 
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="android.test.app.system">
-
+          package="android.test.app.vendor">
+    <instrumentation android:name="androidx.test.runner.AndroidJUnitRunner"
+                     android:targetPackage="android.test.app.vendor" />
     <application>
-        <activity android:name="android.test.app.TestActivity" >
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+        <uses-library android:name="android.test.systemsharedlib" />
+        <uses-native-library android:required="false" android:name="libfoo.oem1.so" />
+        <uses-native-library android:required="false" android:name="libbar.oem1.so" />
+        <uses-native-library android:required="false" android:name="libfoo.oem2.so" />
+        <!--libbar.oem2.so is left out -->
+        <uses-native-library android:required="false" android:name="libfoo.product1.so" />
+        <uses-native-library android:required="false" android:name="libbar.product1.so" />
     </application>
-
 </manifest>
 
