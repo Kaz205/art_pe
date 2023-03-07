@@ -16,12 +16,11 @@
 
 #include "reporter.h"
 
-#include <android-base/parseint.h>
-
 #include <algorithm>
 
+#include <android-base/parseint.h>
+
 #include "base/flags.h"
-#include "base/stl_util.h"
 #include "oat_file_manager.h"
 #include "runtime.h"
 #include "runtime_options.h"
@@ -209,7 +208,7 @@ void MetricsReporter::ReportMetrics() {
     session_started_ = true;
   }
 
-  metrics->ReportAllMetricsAndResetValueMetrics(MakeNonOwningPointerVector(backends_));
+  metrics->ReportAllMetricsAndResetValueMetrics(ToRawPointers(backends_));
 }
 
 void MetricsReporter::UpdateSessionInBackends() {
